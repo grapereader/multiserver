@@ -137,6 +137,22 @@ func (p *postgresProvider) SetPrivs(name string, privs map[string]bool) error {
 			}
 		}
 	}
+
+	_, err = stmt.Exec()
+	if err != nil {
+		return err
+	}
+
+	err = stmt.Close()
+	if err != nil {
+		return err
+	}
+
+	err = txn.Commit()
+	if err != nil {
+		return err
+	}
+
 	return err
 }
 

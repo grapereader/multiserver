@@ -6,6 +6,8 @@ import (
 	"log"
 	"strings"
 
+	"github.com/lib/pq"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -47,6 +49,36 @@ func decodePrivs(s string) map[string]bool {
 	return r
 }
 
+func (p *sqliteProvider) Privs(name string) (map[string]bool, error) {
+	var eprivs string
+	err := p.db.QueryRow(`SELECT privileges FROM privileges WHERE name = $1;`, name).Scan(&eprivs)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return make(map[string]bool), err
+	}
+
+	return decodePrivs(eprivs), nil
+}
+
+func (p *postgresProvider) Privs(name string) (map[string]bool, error) {
+	rows, err := p.db.Query(`SELECT privilege FROM user_privileges INNER JOIN auth ON user_privileges.id = auth.id WHERE auth.name = $1;`, name)
+
+	if err != nil {
+		return make(map[string]bool), err
+	}
+
+	privs := make(map[string]bool)
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			log.Print(err)
+			return make(map[string]bool), err
+		}
+		privs[r] = true
+	}
+
+	return privs, nil
+}
+
 // Privs returns the privileges of a player
 func Privs(name string) (map[string]bool, error) {
 	db, err := authDB()
@@ -55,18 +87,57 @@ func Privs(name string) (map[string]bool, error) {
 	}
 	defer db.Close()
 
-	var eprivs string
-	err = db.QueryRow(`SELECT privileges FROM privileges WHERE name = $1;`, name).Scan(&eprivs)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return make(map[string]bool), err
-	}
-
-	return decodePrivs(eprivs), nil
+	return db.Privs(name)
 }
 
 // Privs returns the privileges of a Conn
 func (c *Conn) Privs() (map[string]bool, error) {
 	return Privs(c.Username())
+}
+
+func (p *sqliteProvider) SetPrivs(name string, privs map[string]bool) error {
+	_, err := p.db.Exec(`INSERT INTO privileges (
+		name,
+		privileges
+	) VALUES ($1, $2) 
+	ON CONFLICT (name) DO UPDATE SET
+		privileges = excluded.privileges;
+	`, name, encodePrivs(privs))
+	return err
+}
+
+func (p *postgresProvider) SetPrivs(name string, privs map[string]bool) error {
+	_, err := p.db.Exec(`DELETE FROM user_privileges INNER JOIN auth ON user_privileges.id = auth.id WHERE auth.name = $1`, name)
+	if err != nil {
+		log.Print(err)
+	}
+
+	var id int
+	err = p.db.QueryRow(`SELECT id FROM auth WHERE name = $1`, name).Scan(&id)
+	if err != nil {
+		log.Print(err)
+		return err
+	}
+
+	txn, err := p.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	stmt, err := txn.Prepare(pq.CopyIn("user_privileges", "id", "privilege"))
+	if err != nil {
+		return err
+	}
+
+	for priv := range privs {
+		if privs[priv] {
+			_, err = stmt.Exec(id, priv)
+			if err != nil {
+				log.Print(err)
+			}
+		}
+	}
+	return err
 }
 
 // SetPrivs sets the privileges of a player
@@ -77,16 +148,7 @@ func SetPrivs(name string, privs map[string]bool) error {
 	}
 	defer db.Close()
 
-	_, err = db.Exec(`INSERT INTO privileges (
-	name,
-	privileges
-) VALUES (
-	$1,
-	$2
-);`, name, encodePrivs(privs))
-	_, err = db.Exec(`UPDATE privileges SET privileges = $1 WHERE name = $2;`, encodePrivs(privs), name)
-
-	return err
+	return db.SetPrivs(name, privs)
 }
 
 // SetPrivs sets the privileges of a Conn

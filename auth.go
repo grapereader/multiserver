@@ -17,6 +17,26 @@ const (
 	AuthMechFirstSRP
 )
 
+type authProvider interface {
+	CreateUser(name string, password string) error
+	Password(name string) (string, error)
+	SetPassword(name string, password string) error
+	Ban(addr, name string) error
+	Unban(id string) error
+	BanList() (map[string]string, error)
+	IsBanned(addr string) (bool, string, error)
+	Privs(name string) (map[string]bool, error)
+	SetPrivs(name string, privs map[string]bool) error
+	Close() error
+}
+
+type sqliteProvider struct {
+	db *DB
+}
+type postgresProvider struct {
+	db *DB
+}
+
 var passPhrase []byte
 
 func encodeVerifierAndSalt(s, v []byte) string {
@@ -40,35 +60,46 @@ func decodeVerifierAndSalt(src string) ([]byte, []byte, error) {
 	return s, v, nil
 }
 
-func authDB() (*DB, error) {
-	sqlite3 := func() (*DB, error) {
-		return OpenSQLite3("auth.sqlite", `CREATE TABLE IF NOT EXISTS auth (
-	name VARCHAR(32) PRIMARY KEY NOT NULL,
-	password VARCHAR(512) NOT NULL
-);
-CREATE TABLE IF NOT EXISTS privileges (
-	name VARCHAR(32) PRIMARY KEY NOT NULL,
-	privileges VARCHAR(1024)
-);
-CREATE TABLE IF NOT EXISTS ban (
-	addr VARCHAR(39) PRIMARY KEY NOT NULL,
-	name VARCHAR(32) NOT NULL
-);`)
+func authDB() (authProvider, error) {
+	sqlite3 := func() (*sqliteProvider, error) {
+		db, err := OpenSQLite3("auth.sqlite", `
+			CREATE TABLE IF NOT EXISTS auth (
+				name VARCHAR(32) PRIMARY KEY NOT NULL,
+				password VARCHAR(512) NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS privileges (
+				name VARCHAR(32) PRIMARY KEY NOT NULL,
+				privileges VARCHAR(1024)
+			);
+			CREATE TABLE IF NOT EXISTS ban (
+				addr VARCHAR(39) PRIMARY KEY NOT NULL,
+				name VARCHAR(32) NOT NULL
+			);
+		`)
+		return &sqliteProvider{db: db}, err
 	}
 
-	psql := func(name, user, password, host string, port int) (*DB, error) {
-		return OpenPSQL(name, user, password, `CREATE TABLE IF NOT EXISTS auth (
-	name VARCHAR(32) PRIMARY KEY NOT NULL,
-	password VARCHAR(512) NOT NULL
-);
-CREATE TABLE IF NOT EXISTS privileges (
-	name VARCHAR(32) PRIMARY KEY NOT NULL,
-	privileges VARCHAR(1024)
-);
-CREATE TABLE IF NOT EXISTS ban (
-	addr VARCHAR(39) PRIMARY KEY NOT NULL,
-	name VARCHAR(32) NOT NULL
-);`, host, port)
+	psql := func(name, user, password, host string, port int) (*postgresProvider, error) {
+		db, err := OpenPSQL(name, user, password, `
+			CREATE TABLE IF NOT EXISTS auth (
+				id SERIAL,
+				name VARCHAR(32) NOT NULL,
+				password VARCHAR(512) NOT NULL,
+				PRIMARY KEY (id)
+			);
+			CREATE TABLE IF NOT EXISTS user_privileges (
+				id INT,
+				name VARCHAR(32) NOT NULL,
+				privilege VARCHAR(1024),
+				PRIMARY KEY (id, privilege),
+				CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES auth (id) ON DELETE CASCADE
+			);
+			CREATE TABLE IF NOT EXISTS ban (
+				addr VARCHAR(39) NOT NULL,
+				name VARCHAR(32) NOT NULL
+			);
+		`, host, port)
+		return &postgresProvider{db: db}, err
 	}
 
 	db, ok := ConfKey("psql_db").(string)
@@ -102,6 +133,69 @@ CREATE TABLE IF NOT EXISTS ban (
 	return psql(db, user, password, host, port)
 }
 
+func (p *sqliteProvider) Close() error {
+	return p.db.Close()
+}
+
+func (p *postgresProvider) Close() error {
+	return p.db.Close()
+}
+
+func (p *sqliteProvider) CreateUser(name string, password string) error {
+	_, err := p.db.Exec(`INSERT INTO auth (
+		name,
+		password
+	) VALUES (
+		?,
+		?
+	);`, name, password)
+	return err
+}
+
+func (p *postgresProvider) CreateUser(name string, password string) error {
+	_, err := p.db.Exec(`INSERT INTO auth (
+		name,
+		password
+	) VALUES (
+		$1,
+		$2
+	);`, name, "#1#"+password)
+	return err
+}
+
+func (p *sqliteProvider) Password(name string) (string, error) {
+	var pwd string
+	err := p.db.QueryRow(`SELECT password FROM auth WHERE name = ?;`, name).Scan(&pwd)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	return pwd, nil
+}
+
+func (p *postgresProvider) Password(name string) (string, error) {
+	var pwd string
+	err := p.db.QueryRow(`SELECT password FROM auth WHERE name = $1;`, name).Scan(&pwd)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	// lop off the #1# bit to be consistent with minetest
+	runes := []rune(pwd)[3:]
+
+	return string(runes), nil
+}
+
+func (p *sqliteProvider) SetPassword(name string, password string) error {
+	_, err := p.db.Exec(`UPDATE auth SET password = ? WHERE name = ?;`, password, name)
+	return err
+}
+
+func (p *postgresProvider) SetPassword(name string, password string) error {
+	_, err := p.db.Exec(`UPDATE auth SET password = $1 WHERE name = $2;`, password, name)
+	return err
+}
+
 // CreateUser creates a new entry in the authentication database
 func CreateUser(name string, verifier, salt []byte) error {
 	db, err := authDB()
@@ -112,14 +206,7 @@ func CreateUser(name string, verifier, salt []byte) error {
 
 	pwd := encodeVerifierAndSalt(salt, verifier)
 
-	_, err = db.Exec(`INSERT INTO auth (
-	name,
-	password
-) VALUES (
-	$1,
-	$2
-);`, name, pwd)
-	return err
+	return db.CreateUser(name, pwd)
 }
 
 // Password returns the SRP tokens of a user
@@ -130,9 +217,8 @@ func Password(name string) ([]byte, []byte, error) {
 	}
 	defer db.Close()
 
-	var pwd string
-	err = db.QueryRow(`SELECT password FROM auth WHERE name = $1;`, name).Scan(&pwd)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	pwd, err := db.Password(name)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -154,7 +240,7 @@ func SetPassword(name string, verifier, salt []byte) error {
 
 	pwd := encodeVerifierAndSalt(salt, verifier)
 
-	_, err = db.Exec(`UPDATE auth SET password = $1 WHERE name = $2;`, pwd, name)
+	err = db.SetPassword(pwd, name)
 	return err
 }
 

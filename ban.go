@@ -11,14 +11,7 @@ import (
 
 var ErrInvalidAddress = errors.New("invalid ip address format")
 
-// BanList returns the list of banned players and IP addresses
-func BanList() (map[string]string, error) {
-	db, err := authDB()
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
+func banList(db *DB) (map[string]string, error) {
 	rows, err := db.Query(`SELECT addr, name FROM ban;`)
 	if err != nil {
 		return nil, err
@@ -39,6 +32,43 @@ func BanList() (map[string]string, error) {
 	return r, nil
 }
 
+func (p *sqliteProvider) BanList() (map[string]string, error) {
+	return banList(p.db)
+}
+
+func (p *postgresProvider) BanList() (map[string]string, error) {
+	return banList(p.db)
+}
+
+// BanList returns the list of banned players and IP addresses
+func BanList() (map[string]string, error) {
+	db, err := authDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	return db.BanList()
+}
+
+func isBanned(db *DB, addr string) (bool, string, error) {
+	var name string
+	err := db.QueryRow(`SELECT name FROM ban WHERE addr = $1;`, addr).Scan(&name)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return true, "", err
+	}
+
+	return name != "", name, nil
+}
+
+func (p *sqliteProvider) IsBanned(addr string) (bool, string, error) {
+	return isBanned(p.db, addr)
+}
+
+func (p *postgresProvider) IsBanned(addr string) (bool, string, error) {
+	return isBanned(p.db, addr)
+}
+
 // IsBanned reports whether an IP address is banned
 func IsBanned(addr string) (bool, string, error) {
 	db, err := authDB()
@@ -46,14 +76,7 @@ func IsBanned(addr string) (bool, string, error) {
 		return true, "", err
 	}
 	defer db.Close()
-
-	var name string
-	err = db.QueryRow(`SELECT name FROM ban WHERE addr = $1;`, addr).Scan(&name)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return true, "", err
-	}
-
-	return name != "", name, nil
+	return db.IsBanned(addr)
 }
 
 // IsBanned reports whether a Conn is banned
@@ -68,6 +91,29 @@ func (c *Conn) IsBanned() (bool, string, error) {
 	return banned, name, nil
 }
 
+func ban(db *DB, addr, name string) error {
+	if net.ParseIP(addr) == nil {
+		return ErrInvalidAddress
+	}
+
+	_, err := db.Exec(`INSERT INTO ban (
+		addr,
+		name
+	) VALUES (
+		$1,
+		$2
+	);`, addr, name)
+	return err
+}
+
+func (p *sqliteProvider) Ban(addr, name string) error {
+	return ban(p.db, addr, name)
+}
+
+func (p *postgresProvider) Ban(addr, name string) error {
+	return ban(p.db, addr, name)
+}
+
 // Ban adds an IP address to the ban list
 func Ban(addr, name string) error {
 	db, err := authDB()
@@ -75,19 +121,7 @@ func Ban(addr, name string) error {
 		return err
 	}
 	defer db.Close()
-
-	if net.ParseIP(addr) == nil {
-		return ErrInvalidAddress
-	}
-
-	_, err = db.Exec(`INSERT INTO ban (
-	addr,
-	name
-) VALUES (
-	$1,
-	$2
-);`, addr, name)
-	return err
+	return db.Ban(addr, name)
 }
 
 // Ban adds a Conn to the ban list
@@ -110,6 +144,19 @@ func (c *Conn) Ban() error {
 	return nil
 }
 
+func unban(db *DB, id string) error {
+	_, err := db.Exec(`DELETE FROM ban WHERE name = $1 OR addr = $2;`, id, id)
+	return err
+}
+
+func (p *sqliteProvider) Unban(id string) error {
+	return unban(p.db, id)
+}
+
+func (p *postgresProvider) Unban(id string) error {
+	return unban(p.db, id)
+}
+
 // Unban removes a player from the ban list
 func Unban(id string) error {
 	db, err := authDB()
@@ -118,6 +165,5 @@ func Unban(id string) error {
 	}
 	defer db.Close()
 
-	_, err = db.Exec(`DELETE FROM ban WHERE name = $1 OR addr = $2;`, id, id)
-	return err
+	return db.Unban(id)
 }
